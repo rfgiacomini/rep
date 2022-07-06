@@ -1,0 +1,223 @@
+stages:
+  - release
+  - upgradebase
+  - build
+  - test
+  - approvals
+  - security
+  - deploy
+  - migrate
+  - static
+
+image: $CI_REGISTRY/maistodos/kitkat
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+  
+  # === COMMON === #
+
+.credentials:
+  before_script:
+    - source /kitkat/ci/ssh_auth.sh
+    - source /kitkat/ci/inject_env.sh
+    - aws eks --region us-east-1 update-kubeconfig --name "$EKS_CLUSTER_NAME"
+
+.rotate_passwords:
+  stage: security
+  extends: .credentials
+  script:
+    - rotate-jupyter-secret
+
+.build_image:
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375
+  stage: build
+  extends: .credentials
+  services:
+    - docker:20.10.8-dind
+  script:
+    - source /kitkat/ci/build_image.sh
+
+.deploy:
+  stage: deploy
+  extends: .credentials
+  allow_failure: false
+
+.migrate:
+  stage: migrate
+  extends: .credentials
+  script:
+    - kubectl -n $K8S_NAMESPACE exec deployment.apps/$K8S_DEPLOYMENT python manage.py migrate
+  when: manual
+
+.static:
+  stage: static
+  extends: .credentials
+  allow_failure: false
+  when: manual
+
+.upgrade_baseimage:
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375
+  extends: .credentials
+  stage: upgradebase
+  allow_failure: false
+  services:
+    - docker:20.10.8-dind
+  script:
+    - DOCKER_BUILDKIT=1 docker build --ssh default -t $CI_REGISTRY_IMAGE/portaldetodos-base:latest -f docker/base/Dockerfile .
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker push $CI_REGISTRY_IMAGE/portaldetodos-base:latest
+
+# Jobs
+approvals:
+   stage: approvals
+   allow_failure: false
+   script:
+    - 'HAS_APPROVE="$(curl -s https://56v9i5mop7.execute-api.us-east-1.amazonaws.com/api/approvals/$CI_PROJECT_ID/$CI_MERGE_REQUEST_IID)"'
+    - echo HAS_APPROVE is $HAS_APPROVE
+    - if [ $HAS_APPROVE = "true" ]; then exit 0; else exit 1; fi
+   only:
+    - merge_requests
+
+tests:
+  stage: test
+  before_script:
+    - if [ "$CI_COMMIT_REF_NAME" = "develop" ] || [ "$CI_COMMIT_REF_NAME" = "master" ] ; then echo "Branch $CI_COMMIT_REF_NAME"; else /kitkat/ci/changelog.sh; fi
+    - source /kitkat/ci/ssh_auth.sh
+    - source /kitkat/ci/inject_env.sh
+  script:
+    - pip install -r requirements/tests.txt
+    - pip install -r requirements/base-git.txt --upgrade
+    - pip install -r requirements/base.txt
+    - safety check -i 44715
+    - py.test -s --durations=20 --cov-report term --cov-fail-under 86
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TITLE =~ /^WIP:/ || $CI_MERGE_REQUEST_TITLE =~ /^Draft:/)
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+
+sonarcloud-check:
+  stage: security
+  variables:
+    GIT_DEPTH: "0"
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  cache:
+    paths:
+      - tests/coverage.xml
+  dependencies:
+    - tests
+  script:
+    - sonar-scanner
+  only:
+    - merge_requests
+
+releaser:
+  stage: release
+  variables:
+    GIT_STRATEGY: clone
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - ./ci/releaser.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_COMMIT_MESSAGE =~ /^v{1}[\d]+\.[\d]+\.[\d]+$/im
+      when: always
+    - if: $CI_COMMIT_BRANCH == "master" && $CI_COMMIT_MESSAGE =~ /^hotfix/im
+      when: always
+
+# === HOMOLOG === #
+upgrade_baseimage:
+  stage: upgradebase
+  extends: .upgrade_baseimage
+  environment:
+    name: homolog
+  only:
+    refs:
+      - develop
+    changes:
+      - requirements/*
+
+rotate_jupyter_homolog:
+  extends: .rotate_passwords
+  environment: homolog
+  only:
+    - develop
+
+build_homolog:
+  extends: .build_image
+  environment:
+    name: homolog
+  only:
+    - develop
+
+deploy_homolog:
+  extends: .deploy
+  script:
+    - envsubst < deploy-homolog.yaml | kubectl -n $K8S_NAMESPACE apply -f -
+  environment:
+    name: homolog
+  only:
+    - develop
+
+migrate_homolog:
+  extends: .migrate
+  environment:
+    name: homolog
+  only:
+    - develop
+
+collectstatic_homolog:
+  extends: .static
+  script:
+    - kubectl -n $K8S_NAMESPACE exec deployment.apps/$K8S_DEPLOYMENT -- python manage.py collectstatic --noinput
+  environment:
+    name: homolog
+  only:
+    - develop
+
+# === PROD === #
+build_prod:
+  extends: .build_image
+  environment:
+    name: prod
+  only:
+    - master
+
+rotate_jupyter_prod:
+  extends: .rotate_passwords
+  environment: prod
+  only:
+    - master
+
+deploy_prod:
+  extends: .deploy
+  script:
+    - envsubst < deploy.yaml | kubectl -n $K8S_NAMESPACE apply -f -
+  environment:
+    name: prod
+  when: manual
+  only:
+    - master
+
+migrate_prod:
+  allow_failure: false
+  extends: .migrate
+  environment:
+    name: prod
+  only:
+    - master
+
+collectstatic_prod:
+  extends: .static
+  script:
+    - kubectl -n $K8S_NAMESPACE exec deployment.apps/$K8S_DEPLOYMENT -- python manage.py collectstatic --noinput --settings=partnerportal.collectstatic
+  environment:
+    name: prod
+  only:
+    - master

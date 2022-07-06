@@ -1,0 +1,206 @@
+stages:
+  - release
+  - test
+  - approvals
+  - security
+  - build
+  - deploy
+  - migrate
+  - static
+
+image: $CI_REGISTRY/maistodos/kitkat
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Defines the location of the analysis task cache
+
+# === COMMON === #
+
+.credentials:
+  before_script:
+    - source /kitkat/ci/inject_env.sh
+    - source /kitkat/ci/ssh_auth.sh
+    - aws eks --region us-east-1 update-kubeconfig --name "$EKS_CLUSTER_NAME"
+
+.rotate_passwords:
+  stage: security
+  extends: .credentials
+  script:
+    - rotate-jupyter-secret
+
+.build_image:
+  stage: build
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375
+  extends: .credentials
+  allow_failure: false
+  services:
+    - docker:20.10.8-dind
+  script:
+    - source /kitkat/ci/build_image.sh
+
+.deploy:
+  stage: deploy
+  extends: .credentials
+  allow_failure: false
+
+.migrate:
+  stage: migrate
+  extends: .credentials
+  allow_failure: false
+  script:
+    - kubectl -n $K8S_NAMESPACE exec deployment.apps/$K8S_DEPLOYMENT python manage.py migrate
+
+.static:
+  stage: static
+  extends: .credentials
+  allow_failure: false
+  when: manual
+  script:
+    - kubectl -n $K8S_NAMESPACE exec deployment.apps/$K8S_DEPLOYMENT -- python manage.py collectstatic --noinput
+
+# Jobs
+approvals:
+   stage: approvals
+   allow_failure: false
+   script:
+    - echo $CI_MERGE_REQUEST_ID
+    - echo $CI_MERGE_REQUEST_IID
+    - echo $CI_PROJECT_ID
+    - 'HAS_APPROVE="$(curl -s https://56v9i5mop7.execute-api.us-east-1.amazonaws.com/api/approvals/$CI_PROJECT_ID/$CI_MERGE_REQUEST_IID)"'
+    - echo HAS_APPROVE is $HAS_APPROVE
+    - echo $HAS_APPROVE
+    - if [ $HAS_APPROVE = "true" ]; then exit 0; else exit 1; fi
+   only:
+    - merge_requests
+
+tests:
+  stage: test
+  before_script:
+    - if [ "$CI_COMMIT_REF_NAME" = "develop" ] || [ "$CI_COMMIT_REF_NAME" = "master" ] ; then echo "Branch $CI_COMMIT_REF_NAME"; else /kitkat/ci/changelog.sh; fi
+    - source /kitkat/ci/ssh_auth.sh
+    - source /kitkat/ci/inject_env.sh
+    - pip install -r requirements/tests.txt
+    - pip install -r requirements/base-git.txt --upgrade
+    - pip install -r requirements/base.txt
+  script:
+    - safety check
+    - py.test -s --cov-report term --cov-report xml:tests/coverage.xml --cov-fail-under 100
+  cache:
+    paths:
+      - tests/coverage.xml
+  artifacts:
+    paths:
+      - tests/coverage.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TITLE =~ /^WIP:/ || $CI_MERGE_REQUEST_TITLE =~ /^Draft:/)
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+sonarcloud-check:
+  stage: security
+  variables:
+    GIT_DEPTH: "0"
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  cache:
+    paths:
+      - tests/coverage.xml
+  dependencies:
+    - tests
+  script:
+    - sonar-scanner
+  only:
+    - merge_requests
+
+releaser:
+  variables:
+    GIT_STRATEGY: clone
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - ./ci/releaser.sh
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && ($CI_COMMIT_MESSAGE =~ /^v*.*/i || $CI_COMMIT_MESSAGE =~ /Release/i)
+      when: always
+
+# === HOMOLOG === #
+
+rotate_jupyter_homolog:
+  extends: .rotate_passwords
+  environment: homolog
+  only:
+    - develop
+
+build_homolog:
+  stage: build
+  extends: .build_image
+  environment:
+    name: homolog
+  only:
+    - develop
+
+deploy_homolog:
+  extends: .deploy
+  script:
+    - envsubst < deploy-homolog.yaml | kubectl -n $K8S_NAMESPACE apply -f -
+  environment:
+    name: homolog
+  only:
+    - develop
+
+migrate_homolog:
+  extends: .migrate
+  environment:
+    name: homolog
+  only:
+    - develop
+
+collectstatic_homolog:
+  extends: .static
+  environment:
+    name: homolog
+  only:
+    - develop
+
+# === PROD === #
+
+rotate_jupyter_prod:
+  extends: .rotate_passwords
+  environment: prod
+  only:
+    - master
+
+build_prod:
+  extends: .build_image
+  environment:
+    name: prod
+  only:
+    - master
+
+deploy_prod:
+  extends: .deploy
+  when: manual
+  script:
+    - envsubst < deploy.yaml | kubectl -n $K8S_NAMESPACE apply -f -
+  environment:
+    name: prod
+  only:
+    - master
+
+migrate_prod:
+  extends: .migrate
+  when: manual
+  environment:
+    name: prod
+  only:
+    - master
+
+collectstatic_prod:
+  extends: .static
+  environment:
+    name: prod
+  only:
+    - master
